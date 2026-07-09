@@ -1,10 +1,10 @@
 import io
+import base64
 
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from PIL import Image
 import pandas as pd
 from datetime import date
 
@@ -54,27 +54,39 @@ def get_client():
     return gspread.authorize(get_credentials())
 
 
-@st.cache_resource
-def get_drive_service():
-    return build("drive", "v3", credentials=get_credentials())
+# Batas aman panjang karakter per sel Google Sheets adalah 50.000 karakter.
+# Dikasih ruang aman di bawahnya biar gak mepet.
+MAX_DATA_URI_CHARS = 45000
 
 
-def upload_photo_to_drive(uploaded_file):
-    """Upload file foto (dari st.file_uploader) ke Google Drive akun servis,
-    jadikan publik (anyone with link, view-only), lalu balikin URL gambarnya."""
-    drive = get_drive_service()
-    file_metadata = {"name": uploaded_file.name}
-    media = MediaIoBaseUpload(
-        io.BytesIO(uploaded_file.getvalue()),
-        mimetype=uploaded_file.type or "image/jpeg",
-        resumable=False,
+def process_uploaded_photo(uploaded_file):
+    """Kompres & resize foto yang diupload lewat st.file_uploader, lalu simpan
+    langsung sebagai data URI (base64) di kolom photo_url pada Google Sheets.
+    Tidak perlu Google Drive sama sekali -> tidak ada masalah kuota penyimpanan
+    service account.
+    """
+    img = Image.open(uploaded_file)
+    img = img.convert("RGB")
+
+    size = 220
+    quality = 75
+    for _ in range(6):
+        resized = img.copy()
+        resized.thumbnail((size, size))
+        buf = io.BytesIO()
+        resized.save(buf, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        data_uri = f"data:image/jpeg;base64,{b64}"
+        if len(data_uri) <= MAX_DATA_URI_CHARS:
+            return data_uri
+        # kalau masih kepanjangan, perkecil ukuran & kualitasnya, coba lagi
+        size = int(size * 0.8)
+        quality = max(35, quality - 10)
+
+    raise ValueError(
+        "Foto masih terlalu besar walau sudah dikompres habis-habisan. "
+        "Coba pakai foto lain (ukuran file asli lebih kecil)."
     )
-    created = drive.files().create(body=file_metadata, media_body=media, fields="id").execute()
-    file_id = created["id"]
-    drive.permissions().create(
-        fileId=file_id, body={"role": "reader", "type": "anyone"}
-    ).execute()
-    return f"https://drive.google.com/uc?export=view&id={file_id}"
 
 
 @st.cache_resource
@@ -140,6 +152,13 @@ def update_employee_name(emp_id, new_name):
     cell = ws_emp.find(str(emp_id), in_column=1)
     if cell:
         ws_emp.update_cell(cell.row, 2, new_name)
+
+
+def update_employee_photo(emp_id, photo_url):
+    ws_emp, _ = get_worksheets()
+    cell = ws_emp.find(str(emp_id), in_column=1)
+    if cell:
+        ws_emp.update_cell(cell.row, 3, photo_url)
 
 
 def delete_employee(emp_id):
@@ -235,15 +254,19 @@ with st.sidebar:
         if submitted and new_name.strip():
             photo_url = new_photo_url.strip()
             if new_photo_file is not None:
-                with st.spinner("Mengunggah foto..."):
-                    photo_url = upload_photo_to_drive(new_photo_file)
+                try:
+                    with st.spinner("Memproses foto..."):
+                        photo_url = process_uploaded_photo(new_photo_file)
+                except Exception as e:
+                    st.error(f"Gagal memproses foto: {e}")
+                    st.stop()
             add_employee(new_name.strip(), photo_url, new_division)
             st.rerun()
 
     st.divider()
     employees_df_sidebar = load_employees_df()
     if not employees_df_sidebar.empty:
-        st.caption("Ubah nama / hapus karyawan")
+        st.caption("Ubah nama / foto / hapus karyawan")
         for _, row in employees_df_sidebar.iterrows():
             c1, c2, c3 = st.columns([3, 1, 1])
             edited_name = c1.text_input(
@@ -259,6 +282,23 @@ with st.sidebar:
             if c3.button("\U0001F5D1\uFE0F", key=f"del_{row['id']}", help="Hapus karyawan"):
                 delete_employee(row["id"])
                 st.rerun()
+
+            with st.expander(f"\U0001F4F7 Ganti foto - {row['name']}"):
+                replacement_photo = st.file_uploader(
+                    "Foto baru",
+                    type=["jpg", "jpeg", "png", "webp"],
+                    key=f"photofile_{row['id']}",
+                )
+                if replacement_photo is not None and st.button(
+                    "Simpan foto ini", key=f"savephoto_{row['id']}"
+                ):
+                    try:
+                        with st.spinner("Memproses foto..."):
+                            new_photo_url = process_uploaded_photo(replacement_photo)
+                        update_employee_photo(row["id"], new_photo_url)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Gagal memproses foto: {e}")
 
     st.divider()
     if st.button("\U0001F504 Refresh data dari Sheets"):
