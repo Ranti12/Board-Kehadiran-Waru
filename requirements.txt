@@ -1,5 +1,6 @@
-streamlit>=1.32
+streamlit>=1.37
 gspread
 google-auth
 pandas
 Pillow
+openpyxl
