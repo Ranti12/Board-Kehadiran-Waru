@@ -164,7 +164,7 @@ def process_uploaded_photo(uploaded_file):
 
 # ---------- Data access (dengan cache biar hemat kuota) ----------
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _fetch_employee_records():
     ws_emp, _ = get_worksheets()
     return ws_emp.get_all_records()
@@ -268,6 +268,93 @@ def delete_employee(emp_id):
 def load_attendance_for_date(date_str):
     records = _fetch_attendance_records()
     return {str(r["employee_id"]): r["status"] for r in records if str(r["date"]) == date_str}
+
+
+MONTH_NAMES_ID = [
+    "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember",
+]
+
+# Label singkat khusus buat rekap yang di-download, biar orang lain yang buka
+# langsung paham tanpa perlu tahu arti warna hijau/merah/kuning
+EXPORT_STATUS_LABEL = {
+    "belum": "Belum diisi",
+    "hijau": "Tepat waktu",
+    "merah": "Telat",
+    "kuning": "Absen",
+}
+
+EXPORT_FILL_HEX = {
+    "Tepat waktu": "C6EFCE",
+    "Telat": "FFC7CE",
+    "Absen": "FFEB9C",
+    "Belum diisi": "F2F2F2",
+}
+
+
+def build_monthly_report(year, month):
+    """Rekap kehadiran 1 bulan: baris = karyawan, kolom = tiap tanggal di bulan itu."""
+    records = _fetch_attendance_records()
+    if not records:
+        return pd.DataFrame()
+    df_att = pd.DataFrame(records)
+    month_str = f"{year:04d}-{month:02d}"
+    df_month = df_att[df_att["date"].astype(str).str.startswith(month_str)].copy()
+    if df_month.empty:
+        return pd.DataFrame()
+
+    emp_df = load_employees_df()[["id", "name", "division"]].copy()
+    emp_df["id"] = emp_df["id"].astype(str)
+    df_month["employee_id"] = df_month["employee_id"].astype(str)
+
+    merged = df_month.merge(emp_df, left_on="employee_id", right_on="id", how="left")
+    merged["name"] = merged["name"].fillna("(karyawan sudah dihapus - id " + merged["employee_id"] + ")")
+    merged["division"] = merged["division"].fillna("Lainnya")
+    merged["status_label"] = merged["status"].map(EXPORT_STATUS_LABEL).fillna(merged["status"])
+
+    pivot = merged.pivot_table(
+        index=["division", "name"], columns="date", values="status_label", aggfunc="first"
+    )
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+    pivot = pivot.fillna("Belum diisi")
+    pivot = pivot.reset_index().rename(columns={"division": "Divisi", "name": "Nama"})
+    return pivot
+
+
+def build_excel_bytes(df, sheet_name="Rekap Kehadiran"):
+    """Bikin file .xlsx asli (bukan CSV) dengan header rapi + warna sel sesuai
+    status, biar bisa langsung dibuka di aplikasi apa pun yang bisa baca Excel
+    (WPS, LibreOffice, Google Sheets, dst) tanpa perlu convert dulu."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+
+        header_fill = PatternFill(start_color="2B4C7E", end_color="2B4C7E", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            max_len = max([len(str(col_name))] + [len(str(v)) for v in df[col_name]])
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 3, 28)
+            if col_name not in ("Divisi", "Nama"):
+                for row_idx, value in enumerate(df[col_name], start=2):
+                    hex_color = EXPORT_FILL_HEX.get(str(value))
+                    if hex_color:
+                        ws.cell(row=row_idx, column=col_idx).fill = PatternFill(
+                            start_color=hex_color, end_color=hex_color, fill_type="solid"
+                        )
+                    ws.cell(row=row_idx, column=col_idx).alignment = Alignment(horizontal="center")
+
+        ws.freeze_panes = "C2"
+
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def save_pending_attendance(date_str, pending_changes):
@@ -425,9 +512,13 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    if not employees_df.empty:
+
+    @st.fragment
+    def render_employee_management_panel(emp_df, division_options):
+        if emp_df.empty:
+            return
         st.caption("Ubah nama / divisi / urutan / foto / hapus karyawan")
-        for _, row in employees_df.sort_values(["division", "order"]).iterrows():
+        for _, row in emp_df.sort_values(["division", "order"]).iterrows():
             with st.expander(f"{row['name']} ({row['division']})"):
                 edited_name = st.text_input("Nama", value=row["name"], key=f"name_{row['id']}")
                 opts = division_options if row["division"] in division_options else division_options + [row["division"]]
@@ -463,6 +554,8 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"Gagal memproses foto: {e}")
 
+    render_employee_management_panel(employees_df, division_options)
+
     st.divider()
     if st.button("\U0001F504 Refresh data dari Sheets"):
         _invalidate_employee_cache()
@@ -488,95 +581,128 @@ st.markdown(
 selected_date = st.date_input("Tanggal", value=date.today())
 date_str = selected_date.isoformat()
 
+with st.expander("\U0001F4E5 Download Rekap Bulanan"):
+    exc1, exc2, exc3 = st.columns([2, 2, 1])
+    ex_year = exc1.number_input("Tahun", min_value=2020, max_value=2100, value=date.today().year, step=1)
+    ex_month = exc2.selectbox(
+        "Bulan", options=list(range(1, 13)),
+        format_func=lambda m: MONTH_NAMES_ID[m - 1],
+        index=date.today().month - 1,
+    )
+    if exc3.button("Buat Rekap"):
+        report_df = build_monthly_report(int(ex_year), int(ex_month))
+        st.session_state["_last_report"] = report_df
+        st.session_state["_last_report_label"] = f"{ex_year}-{int(ex_month):02d}"
+
+    last_report = st.session_state.get("_last_report")
+    if last_report is not None:
+        if last_report.empty:
+            st.info("Belum ada data kehadiran di bulan yang dipilih.")
+        else:
+            label = st.session_state.get("_last_report_label", "rekap")
+            excel_bytes = build_excel_bytes(last_report)
+            st.download_button(
+                "\U0001F4C4 Download Excel (.xlsx)",
+                data=excel_bytes,
+                file_name=f"rekap_kehadiran_{label}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.dataframe(last_report, use_container_width=True)
+
 autosave_if_switching_date(date_str)
-attendance_map, dirty_ids = get_working_attendance(date_str)
-
-if dirty_ids:
-    col_warn, col_save = st.columns([4, 1])
-    col_warn.warning(
-        f"\u26A0\uFE0F Ada {len(dirty_ids)} perubahan kehadiran yang belum disimpan ke Google Sheets."
-    )
-    if col_save.button("\U0001F4BE Simpan Sekarang", type="primary"):
-        save_pending_attendance(date_str, {eid: attendance_map[eid] for eid in dirty_ids})
-        st.session_state[f"att_dirty_{date_str}"] = set()
-        st.success("Tersimpan!")
-        st.rerun()
-
-# --- Summary ---
-counts = {"hijau": 0, "merah": 0, "kuning": 0, "belum": 0}
-for _, row in employees_df.iterrows():
-    status = attendance_map.get(str(row["id"]), "belum")
-    counts[status] += 1
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("\U0001F7E2 Tepat waktu", counts["hijau"])
-c2.metric("\U0001F534 Telat", counts["merah"])
-c3.metric("\U0001F7E1 Tidak hadir", counts["kuning"])
-c4.metric("\u26AA Belum diisi", counts["belum"])
-
-st.divider()
 
 
-def render_employee_card(emp, photo_size=44):
-    emp_id = str(emp["id"])
-    current_status = attendance_map.get(emp_id, "belum")
-    photo = emp["photo_url"] if emp.get("photo_url") else placeholder_photo_url(emp["id"])
-    ring = STATUS_COLORS[current_status]
+@st.fragment
+def render_attendance_board(date_str, employees_df, known_divisions, division_cols_config, show_names):
+    attendance_map, dirty_ids = get_working_attendance(date_str)
 
-    st.markdown(
-        f'<div class="emp-photo-wrap"><img src="{photo}" style="width:{photo_size}px;'
-        f'height:{photo_size}px;object-fit:cover;border-radius:50%;'
-        f'border:2.5px solid {ring};"></div>',
-        unsafe_allow_html=True,
-    )
-    if show_names:
-        st.markdown(f'<div class="emp-row-name">{emp["name"]}</div>', unsafe_allow_html=True)
-    chosen = st.selectbox(
-        "Status", options=STATUS_CYCLE, index=STATUS_CYCLE.index(current_status),
-        format_func=lambda s: f"{STATUS_ICON[s]} {STATUS_LABEL[s]}",
-        key=f"sel_{emp_id}_{date_str}", label_visibility="collapsed",
-    )
-    if chosen != current_status:
-        attendance_map[emp_id] = chosen
-        dirty_ids.add(emp_id)
-        st.rerun()
+    if dirty_ids:
+        col_warn, col_save = st.columns([4, 1])
+        col_warn.warning(
+            f"\u26A0\uFE0F Ada {len(dirty_ids)} perubahan kehadiran yang belum disimpan ke Google Sheets."
+        )
+        if col_save.button("\U0001F4BE Simpan Sekarang", type="primary"):
+            save_pending_attendance(date_str, {eid: attendance_map[eid] for eid in dirty_ids})
+            st.session_state[f"att_dirty_{date_str}"] = set()
+            st.success("Tersimpan!")
+            st.rerun()
+
+    # --- Summary ---
+    counts = {"hijau": 0, "merah": 0, "kuning": 0, "belum": 0}
+    for _, row in employees_df.iterrows():
+        status = attendance_map.get(str(row["id"]), "belum")
+        counts[status] += 1
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("\U0001F7E2 Tepat waktu", counts["hijau"])
+    c2.metric("\U0001F534 Telat", counts["merah"])
+    c3.metric("\U0001F7E1 Tidak hadir", counts["kuning"])
+    c4.metric("\u26AA Belum diisi", counts["belum"])
+
+    st.divider()
+
+    def render_employee_card(emp, photo_size=44):
+        emp_id = str(emp["id"])
+        current_status = attendance_map.get(emp_id, "belum")
+        photo = emp["photo_url"] if emp.get("photo_url") else placeholder_photo_url(emp["id"])
+        ring = STATUS_COLORS[current_status]
+
+        st.markdown(
+            f'<div class="emp-photo-wrap"><img src="{photo}" style="width:{photo_size}px;'
+            f'height:{photo_size}px;object-fit:cover;border-radius:50%;'
+            f'border:2.5px solid {ring};"></div>',
+            unsafe_allow_html=True,
+        )
+        if show_names:
+            st.markdown(f'<div class="emp-row-name">{emp["name"]}</div>', unsafe_allow_html=True)
+        chosen = st.selectbox(
+            "Status", options=STATUS_CYCLE, index=STATUS_CYCLE.index(current_status),
+            format_func=lambda s: f"{STATUS_ICON[s]} {STATUS_LABEL[s]}",
+            key=f"sel_{emp_id}_{date_str}", label_visibility="collapsed",
+        )
+        if chosen != current_status:
+            attendance_map[emp_id] = chosen
+            dirty_ids.add(emp_id)
+            st.rerun()
+
+    if employees_df.empty:
+        st.info("Belum ada karyawan. Tambahkan lewat panel di sebelah kiri.")
+    else:
+        kacab_df = employees_df[employees_df["division"].str.lower() == KACAB_NAME.lower()].sort_values("order")
+        if not kacab_df.empty:
+            st.markdown(f'<div class="kacab-header">{KACAB_NAME}</div>', unsafe_allow_html=True)
+            pad = 2
+            total_slots = len(kacab_df) + pad * 2
+            kacab_cols = st.columns(total_slots)
+            for i, (_, emp) in enumerate(kacab_df.iterrows()):
+                with kacab_cols[pad + i]:
+                    render_employee_card(emp, photo_size=64)
+            st.divider()
+
+        grid_df = employees_df[employees_df["division"].str.lower() != KACAB_NAME.lower()]
+        data_divisions = list(grid_df["division"].unique())
+        ordered_divisions = [d for d in known_divisions if d in data_divisions]
+        ordered_divisions += [d for d in data_divisions if d not in ordered_divisions]
+
+        width_ratios = [division_cols_config.get(d, 1) for d in ordered_divisions]
+        division_blocks = st.columns(width_ratios) if ordered_divisions else []
+
+        for div_block, division in zip(division_blocks, ordered_divisions):
+            with div_block:
+                st.markdown(f'<div class="division-header">{division}</div>', unsafe_allow_html=True)
+                n_cols = division_cols_config.get(division, 1)
+                div_employees = grid_df[grid_df["division"] == division].sort_values("order")
+                emp_list = list(div_employees.iterrows())
+                chunks = chunk_column_major(emp_list, n_cols)
+
+                sub_cols = st.columns(n_cols)
+                for sub_col, chunk in zip(sub_cols, chunks):
+                    with sub_col:
+                        for _, emp in chunk:
+                            render_employee_card(emp, photo_size=40)
 
 
-if employees_df.empty:
-    st.info("Belum ada karyawan. Tambahkan lewat panel di sebelah kiri.")
-else:
-    kacab_df = employees_df[employees_df["division"].str.lower() == KACAB_NAME.lower()].sort_values("order")
-    if not kacab_df.empty:
-        st.markdown(f'<div class="kacab-header">{KACAB_NAME}</div>', unsafe_allow_html=True)
-        pad = 2
-        total_slots = len(kacab_df) + pad * 2
-        kacab_cols = st.columns(total_slots)
-        for i, (_, emp) in enumerate(kacab_df.iterrows()):
-            with kacab_cols[pad + i]:
-                render_employee_card(emp, photo_size=64)
-        st.divider()
-
-    grid_df = employees_df[employees_df["division"].str.lower() != KACAB_NAME.lower()]
-    data_divisions = list(grid_df["division"].unique())
-    ordered_divisions = [d for d in known_divisions if d in data_divisions]
-    ordered_divisions += [d for d in data_divisions if d not in ordered_divisions]
-
-    width_ratios = [division_cols_config.get(d, 1) for d in ordered_divisions]
-    division_blocks = st.columns(width_ratios) if ordered_divisions else []
-
-    for div_block, division in zip(division_blocks, ordered_divisions):
-        with div_block:
-            st.markdown(f'<div class="division-header">{division}</div>', unsafe_allow_html=True)
-            n_cols = division_cols_config.get(division, 1)
-            div_employees = grid_df[grid_df["division"] == division].sort_values("order")
-            emp_list = list(div_employees.iterrows())
-            chunks = chunk_column_major(emp_list, n_cols)
-
-            sub_cols = st.columns(n_cols)
-            for sub_col, chunk in zip(sub_cols, chunks):
-                with sub_col:
-                    for _, emp in chunk:
-                        render_employee_card(emp, photo_size=40)
+render_attendance_board(date_str, employees_df, known_divisions, division_cols_config, show_names)
 
 st.caption(
     "Pilih status lewat dropdown di bawah tiap foto. Perubahan disimpan sementara di sesi ini dulu, "
