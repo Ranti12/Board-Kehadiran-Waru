@@ -621,7 +621,7 @@ def render_attendance_board(date_str, employees_df, known_divisions, division_co
         col_warn.warning(
             f"\u26A0\uFE0F Ada {len(dirty_ids)} perubahan kehadiran yang belum disimpan ke Google Sheets."
         )
-        if col_save.button("\U0001F4BE Simpan Sekarang", type="primary"):
+        if col_save.button("\U0001F4BE Simpan Sekarang", type="primary", key=f"savebtn_{date_str}"):
             save_pending_attendance(date_str, {eid: attendance_map[eid] for eid in dirty_ids})
             st.session_state[f"att_dirty_{date_str}"] = set()
             st.success("Tersimpan!")
@@ -641,7 +641,11 @@ def render_attendance_board(date_str, employees_df, known_divisions, division_co
 
     st.divider()
 
-    def render_employee_card(emp, photo_size=44):
+    if employees_df.empty:
+        st.info("Belum ada karyawan. Tambahkan lewat panel di sebelah kiri.")
+        return
+
+    def render_employee_card(emp, selections, photo_size=44):
         emp_id = str(emp["id"])
         current_status = attendance_map.get(emp_id, "belum")
         photo = emp["photo_url"] if emp.get("photo_url") else placeholder_photo_url(emp["id"])
@@ -660,14 +664,16 @@ def render_attendance_board(date_str, employees_df, known_divisions, division_co
             format_func=lambda s: f"{STATUS_ICON[s]} {STATUS_LABEL[s]}",
             key=f"sel_{emp_id}_{date_str}", label_visibility="collapsed",
         )
-        if chosen != current_status:
-            attendance_map[emp_id] = chosen
-            dirty_ids.add(emp_id)
-            st.rerun()
+        # TIDAK langsung disimpan/rerun di sini - ditampung dulu di 'selections',
+        # baru diproses sekaligus saat tombol "Terapkan" di form ditekan.
+        selections[emp_id] = chosen
 
-    if employees_df.empty:
-        st.info("Belum ada karyawan. Tambahkan lewat panel di sebelah kiri.")
-    else:
+    selections = {}
+    with st.form(f"grid_form_{date_str}", clear_on_submit=False):
+        top_submit = st.form_submit_button(
+            "\u2705 Terapkan Perubahan Status", key=f"submit_top_{date_str}"
+        )
+
         kacab_df = employees_df[employees_df["division"].str.lower() == KACAB_NAME.lower()].sort_values("order")
         if not kacab_df.empty:
             st.markdown(f'<div class="kacab-header">{KACAB_NAME}</div>', unsafe_allow_html=True)
@@ -676,7 +682,7 @@ def render_attendance_board(date_str, employees_df, known_divisions, division_co
             kacab_cols = st.columns(total_slots)
             for i, (_, emp) in enumerate(kacab_df.iterrows()):
                 with kacab_cols[pad + i]:
-                    render_employee_card(emp, photo_size=64)
+                    render_employee_card(emp, selections, photo_size=64)
             st.divider()
 
         grid_df = employees_df[employees_df["division"].str.lower() != KACAB_NAME.lower()]
@@ -699,13 +705,31 @@ def render_attendance_board(date_str, employees_df, known_divisions, division_co
                 for sub_col, chunk in zip(sub_cols, chunks):
                     with sub_col:
                         for _, emp in chunk:
-                            render_employee_card(emp, photo_size=40)
+                            render_employee_card(emp, selections, photo_size=40)
+
+        bottom_submit = st.form_submit_button(
+            "\u2705 Terapkan Perubahan Status", key=f"submit_bottom_{date_str}"
+        )
+
+    if top_submit or bottom_submit:
+        changed = 0
+        for emp_id, chosen in selections.items():
+            if attendance_map.get(emp_id, "belum") != chosen:
+                attendance_map[emp_id] = chosen
+                dirty_ids.add(emp_id)
+                changed += 1
+        if changed:
+            st.toast(f"{changed} status diperbarui - klik 'Simpan Sekarang' di atas untuk kirim ke Sheets.")
+            st.rerun()
+        else:
+            st.toast("Tidak ada perubahan.")
 
 
 render_attendance_board(date_str, employees_df, known_divisions, division_cols_config, show_names)
 
 st.caption(
-    "Pilih status lewat dropdown di bawah tiap foto. Perubahan disimpan sementara di sesi ini dulu, "
-    "lalu dikirim ke Google Sheets sekaligus saat kamu klik 'Simpan Sekarang' atau saat ganti tanggal "
-    "(auto-save). Kalau langsung tutup tab/browser tanpa simpan, perubahan yang belum tersimpan bisa hilang."
+    "Pilih status lewat dropdown, ganti sebanyak yang kamu mau (1 divisi atau semuanya), "
+    "baru klik 'Terapkan Perubahan Status' - reload cuma terjadi sekali di situ, bukan tiap "
+    "ganti 1 dropdown. Setelah diterapkan, klik 'Simpan Sekarang' untuk kirim ke Google Sheets "
+    "(atau otomatis tersimpan saat ganti tanggal). Kalau tutup tab sebelum simpan, perubahan bisa hilang."
 )
